@@ -1,0 +1,371 @@
+---
+# Nextcloud + Collabora Online за Tailscale
+# Перед запуском: ansible-galaxy collection install -r requirements.yml
+# У Tailscale admin console мають бути увімкнені MagicDNS та HTTPS Certificates.
+
+- name: Nextcloud & Collabora Online deployment
+  hosts: all
+  become: true
+
+  vars:
+    nc_dir: /opt/nextcloud
+    # Фіксуй мажорні версії: Nextcloud оновлюється лише на одну мажорну версію за раз.
+    # Для чистої установки бери найновіший стабільний тег з Docker Hub.
+    nextcloud_image: "nextcloud:35-apache"          # 35.0.1 станом на 10.2026; патчі 35.x — через docker compose pull
+    collabora_image: "collabora/code:26.04.5.1.1"
+    postgres_image: "postgres:16-alpine"
+    redis_image: "redis:7-alpine"
+    nginx_image: "nginx:stable-alpine"
+
+    # Фіксовані підмережі Docker (використовуються в UFW, Nginx, trusted_proxies, WOPI allowlist)
+    docker_subnet: "172.30.0.0/16"
+    docker_frontend_subnet: "172.30.0.0/24"
+    docker_backend_subnet: "172.30.1.0/24"
+
+    nc_phone_region: "UA"
+    collabora_dictionaries: "en_US uk_UA"   # через пробіл, не через кому
+    collabora_memory_limit: "6G"   # з 16 ГБ ОЗУ ВМ
+
+    compose: "docker compose -f {{ nc_dir }}/docker-compose.yml"
+    occ: "{{ compose }} exec -T -u www-data app php occ"
+
+  vars_prompt:
+    - name: pg_password
+      prompt: "Пароль для PostgreSQL (без символу ' та $)"
+      private: true
+    - name: redis_password
+      prompt: "Пароль для Redis (без символу ' та $)"
+      private: true
+    - name: nc_admin_password
+      prompt: "Пароль адміністратора Nextcloud (admin)"
+      private: true
+    - name: create_users
+      prompt: "Створити тестових користувачів? (yes/no)"
+      default: "yes"
+      private: false
+    - name: user_count
+      prompt: "Кількість користувачів"
+      default: "30"
+      private: false
+    - name: user_password
+      prompt: "Єдиний пароль для всіх тестових користувачів"
+      private: true
+
+  handlers:
+    - name: Restart docker
+      ansible.builtin.systemd:
+        name: docker
+        state: restarted
+
+    - name: Restart nginx
+      community.docker.docker_compose_v2:
+        project_src: "{{ nc_dir }}"
+        services: [web]
+        state: restarted
+
+    - name: Restart collabora
+      community.docker.docker_compose_v2:
+        project_src: "{{ nc_dir }}"
+        services: [collabora]
+        state: restarted
+
+  tasks:
+    - name: Перевірка паролів (лапка ' зламає .env)
+      ansible.builtin.assert:
+        that:
+          - "\"'\" not in pg_password"
+          - "\"'\" not in redis_password"
+          - "\"'\" not in nc_admin_password"
+          - "'$' not in pg_password"
+          - "'$' not in redis_password"
+          - pg_password | length > 0
+          - redis_password | length > 0
+          - nc_admin_password | length > 0
+        fail_msg: "Паролі не можуть бути порожніми або містити символ ' (а паролі БД/Redis — ще й $)"
+      no_log: true
+
+    # ---------- Пакети, Docker ----------
+    - name: Встановлення базових пакетів
+      ansible.builtin.apt:
+        name:
+          - docker.io
+          - docker-compose-v2
+          - python3-docker
+          - curl
+          - ufw
+          - qemu-guest-agent
+        state: present
+        update_cache: true
+
+    - name: Guest agent (коректне вимкнення/снапшоти з Proxmox) та TRIM для ZFS
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        enabled: true
+        state: started
+      loop:
+        - qemu-guest-agent
+        - fstrim.timer
+
+    - name: Ротація логів Docker (щоб json-логи не з'їли диск)
+      ansible.builtin.copy:
+        dest: /etc/docker/daemon.json
+        mode: "0644"
+        content: |
+          {
+            "log-driver": "json-file",
+            "log-opts": { "max-size": "20m", "max-file": "3" }
+          }
+      notify: Restart docker
+
+    - name: Застосувати зміни Docker до запуску контейнерів
+      ansible.builtin.meta: flush_handlers
+
+    # ---------- Firewall: спочатку правила, потім enable ----------
+    - name: UFW — дозволити SSH
+      community.general.ufw:
+        rule: allow
+        port: "22"
+        proto: tcp
+
+    - name: UFW — дозволити весь вхідний трафік з Tailscale
+      community.general.ufw:
+        rule: allow
+        direction: in
+        interface: tailscale0
+
+    - name: UFW — дозволити контейнерам звертатись до Nginx на хості (WOPI)
+      community.general.ufw:
+        rule: allow
+        proto: tcp
+        port: "443"
+        src: "{{ item }}"
+      loop:
+        - "{{ docker_subnet }}"
+        - "172.17.0.0/16"
+
+    - name: UFW — увімкнути, вхідні за замовчуванням deny
+      community.general.ufw:
+        state: enabled
+        direction: incoming
+        policy: deny
+
+    # ---------- Tailscale ----------
+    - name: Встановлення Tailscale
+      ansible.builtin.shell: curl -fsSL https://tailscale.com/install.sh | sh
+      args:
+        creates: /usr/bin/tailscale
+
+    # Підключення до tailnet робиться вручну: sudo tailscale up
+    - name: Дані вузла Tailscale
+      ansible.builtin.command: tailscale status --json
+      register: ts_self
+      changed_when: false
+      failed_when: false
+
+    - name: Перевірка, що ВМ уже в tailnet
+      ansible.builtin.assert:
+        that: (ts_self.stdout | default('{}', true) | from_json).BackendState | default('') == 'Running'
+        fail_msg: >-
+          ВМ ще не підключена до Tailscale. Виконай на ній `sudo tailscale up`,
+          авторизуй вузол у браузері й запусти плейбук ще раз.
+
+    - name: Збереження MagicDNS-домену та IP
+      ansible.builtin.set_fact:
+        tailscale_domain: "{{ (ts_self.stdout | from_json).Self.DNSName | regex_replace('\\.$', '') }}"
+        tailscale_ip: "{{ (ts_self.stdout | from_json).Self.TailscaleIPs[0] }}"
+
+    - name: Перевірка домену
+      ansible.builtin.assert:
+        that: tailscale_domain is search('\.ts\.net$')
+        fail_msg: "Не вдалося отримати MagicDNS-домен: {{ tailscale_domain }}"
+
+    # З --accept-dns=false хост не резолвить *.ts.net, тож прописуємо домен локально
+    - name: Домен Tailscale в /etc/hosts
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        regexp: '\s{{ tailscale_domain | regex_escape }}$'
+        line: "{{ tailscale_ip }} {{ tailscale_domain }}"
+
+    # ---------- Файли проєкту ----------
+    - name: Створення директорій
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      loop:
+        - "{{ nc_dir }}"
+        - "{{ nc_dir }}/certs"
+        - "{{ nc_dir }}/backups"
+        - "{{ nc_dir }}/fonts"
+
+    - name: Перший випуск TLS-сертифіката Tailscale (далі — systemd-таймер)
+      ansible.builtin.command: >-
+        tailscale cert
+        --cert-file {{ nc_dir }}/certs/fullchain.pem
+        --key-file {{ nc_dir }}/certs/privkey.pem
+        {{ tailscale_domain }}
+      args:
+        creates: "{{ nc_dir }}/certs/fullchain.pem"
+
+    - name: Копіювання шрифтів
+      ansible.builtin.copy:
+        src: files/fonts/
+        dest: "{{ nc_dir }}/fonts/"
+        mode: "0644"
+      notify: Restart collabora
+
+    - name: .env (секрети)
+      ansible.builtin.template:
+        src: templates/.env.j2
+        dest: "{{ nc_dir }}/.env"
+        mode: "0600"
+      no_log: true
+
+    - name: docker-compose.yml
+      ansible.builtin.template:
+        src: templates/docker-compose.yml.j2
+        dest: "{{ nc_dir }}/docker-compose.yml"
+        mode: "0644"
+
+    - name: nginx.conf
+      ansible.builtin.template:
+        src: templates/nginx.conf.j2
+        dest: "{{ nc_dir }}/nginx.conf"
+        mode: "0644"
+      notify: Restart nginx
+
+    # ---------- Запуск ----------
+    - name: Запуск стеку Docker Compose
+      community.docker.docker_compose_v2:
+        project_src: "{{ nc_dir }}"
+        state: present
+        pull: missing
+
+    - name: Перезапуск сервісів, конфіги яких змінились
+      ansible.builtin.meta: flush_handlers
+
+    - name: Очікування Nginx (HTTPS)
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: 443
+        timeout: 300
+
+    - name: Очікування завершення встановлення Nextcloud
+      ansible.builtin.command: "{{ occ }} status --output=json"
+      register: nc_status
+      changed_when: false
+      failed_when: false
+      until: nc_status.rc == 0 and '"installed":true' in nc_status.stdout
+      retries: 60
+      delay: 10
+
+    - name: Перевірка готовності Nextcloud
+      ansible.builtin.assert:
+        that:
+          - nc_status.rc == 0
+          - "'\"installed\":true' in nc_status.stdout"
+        fail_msg: "Nextcloud не завершив встановлення протягом відведеного часу! Перевірте лог та статус вручну"
+
+    - name: Перевірка Collabora WOPI discovery (через справжній домен і валідний сертифікат)
+      ansible.builtin.uri:
+        url: "https://{{ tailscale_domain }}/hosting/discovery"
+        status_code: 200
+      register: wopi_check
+      until: wopi_check.status == 200
+      retries: 30
+      delay: 10
+
+    # ---------- Налаштування Nextcloud ----------
+    - name: Системні налаштування Nextcloud
+      ansible.builtin.command: "{{ occ }} {{ item }}"
+      loop:
+        - background:cron
+        - config:system:set default_phone_region --value={{ nc_phone_region }}
+        - config:system:set maintenance_window_start --type=integer --value=1
+      changed_when: false
+
+    - name: Список застосунків
+      ansible.builtin.command: "{{ occ }} app:list --output=json"
+      register: nc_apps_raw
+      changed_when: false
+
+    - name: Розбір списку застосунків
+      ansible.builtin.set_fact:
+        nc_apps: "{{ nc_apps_raw.stdout | from_json }}"
+
+    - name: Встановлення Nextcloud Office (richdocuments)
+      ansible.builtin.command: "{{ occ }} app:install richdocuments"
+      when:
+        - "'richdocuments' not in nc_apps.enabled"
+        - "'richdocuments' not in nc_apps.disabled"
+
+    - name: Увімкнення Nextcloud Office (якщо був вимкнений)
+      ansible.builtin.command: "{{ occ }} app:enable richdocuments"
+      when: "'richdocuments' in nc_apps.disabled"
+
+    - name: Підключення Nextcloud Office до Collabora
+      ansible.builtin.command: "{{ occ }} config:app:set richdocuments {{ item.key }} --value={{ item.value }}"
+      loop:
+        - { key: wopi_url, value: "https://{{ tailscale_domain }}" }
+        - { key: disable_certificate_verification, value: "no" }
+      loop_control:
+        label: "{{ item.key }}"
+      changed_when: false
+
+    - name: Активація конфігурації Collabora (завантаження discovery)
+      ansible.builtin.command: "{{ occ }} richdocuments:activate-config"
+      changed_when: false
+
+    # ---------- Тестові користувачі ----------
+    - name: Існуючі користувачі
+      ansible.builtin.command: "{{ occ }} user:list --output=json"
+      register: nc_users
+      changed_when: false
+      when: create_users | bool
+
+    - name: Створення тестових користувачів (u101, u102, ...)
+      ansible.builtin.command: >-
+        {{ compose }} exec -T -e OC_PASS -u www-data app
+        php occ user:add --password-from-env
+        --display-name "User {{ item }}" u{{ 100 + item }}
+      environment:
+        OC_PASS: "{{ user_password }}"
+      loop: "{{ range(1, (user_count | int) + 1) | list }}"
+      loop_control:
+        label: "u{{ 100 + item }}"
+      when:
+        - create_users | bool
+        - nc_users.stdout is defined
+        - ('u' ~ (100 + item)) not in (nc_users.stdout | default('{}') | from_json)
+      no_log: true
+
+    # ---------- Бекапи та оновлення сертифіката ----------
+    - name: Systemd-юніти
+      ansible.builtin.template:
+        src: "templates/{{ item }}.j2"
+        dest: "/etc/systemd/system/{{ item }}"
+        mode: "0644"
+      loop:
+        - pg-backup.service
+        - pg-backup.timer
+        - tailscale-cert.service
+        - tailscale-cert.timer
+
+    - name: Увімкнення таймерів
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        enabled: true
+        state: started
+        daemon_reload: true
+      loop:
+        - pg-backup.timer
+        - tailscale-cert.timer
+
+    # Додаю таску для очищення WOPI Allowlist
+    - name: Видалення WOPI Allowlist у Nextcloud
+      ansible.builtin.command: "{{ occ }} config:app:delete richdocuments wopi_allowlist"
+      register: wopi_result
+      changed_when: "'deleted' in wopi_result.stdout"
+      failed_when: false

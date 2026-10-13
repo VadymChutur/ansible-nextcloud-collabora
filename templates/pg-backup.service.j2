@@ -1,0 +1,13 @@
+[Unit]
+Description=PostgreSQL backup for Nextcloud
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+UMask=0077
+# Дамп стримиться одразу на хост; ім'я з датою, а не %H (у systemd це hostname — бекап перезаписувався б щодня)
+ExecStart=/bin/sh -c 'set -e; f={{ nc_dir }}/backups/nc_db_$(date +%%F_%%H%%M).dump; \
+  docker compose -f {{ nc_dir }}/docker-compose.yml exec -T db pg_dump -U nextcloud -Fc nextcloud > "$f.tmp"; \
+  test -s "$f.tmp"; mv "$f.tmp" "$f"'
+ExecStartPost=/usr/bin/find {{ nc_dir }}/backups -type f -name 'nc_db_*.dump' -mtime +7 -delete

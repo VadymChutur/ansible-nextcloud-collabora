@@ -1,0 +1,11 @@
+# Ansible
+*.retry
+inventory.ini
+
+# Секрети та локальні файли
+.env
+certs/
+backups/
+
+# OS files
+.DS_Store

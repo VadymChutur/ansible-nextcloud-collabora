@@ -1,0 +1,10 @@
+[Unit]
+Description=Renew Tailscale TLS certificate and reload Nginx
+After=tailscaled.service docker.service
+Requires=tailscaled.service
+
+[Service]
+Type=oneshot
+# Сертифікати Tailscale (Let's Encrypt) живуть 90 днів; tailscale cert оновлює лише коли треба
+ExecStart=/usr/bin/tailscale cert --cert-file {{ nc_dir }}/certs/fullchain.pem --key-file {{ nc_dir }}/certs/privkey.pem {{ tailscale_domain }}
+ExecStartPost=/usr/bin/docker compose -f {{ nc_dir }}/docker-compose.yml exec -T web nginx -s reload
