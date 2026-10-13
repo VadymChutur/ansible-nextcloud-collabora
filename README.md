@@ -17,8 +17,8 @@ Idempotent deployment: re-running the playbook is perfectly safe. Tailscale won'
 
 ##  Architecture
 - `web` (Nginx, host network mode) — listens on port 443, allowing traffic exclusively from the Tailnet and local Docker containers.
-- `/` → proxies to Nextcloud (Apache) at 127.0.0.1:8080
-- `/browser`, `/hosting/*`, `/cool/*` → proxies to Collabora at 127.0.0.1:9980
+  - `/` → proxies to Nextcloud (Apache) at 127.0.0.1:8080
+  - `/browser`, `/hosting/*`, `/cool/*` → proxies to Collabora at 127.0.0.1:9980
 - `app` + `cron` — Nextcloud core; `db` (PostgreSQL) and `redis` run in an isolated internal Docker network without internet access.
 
 - Nextcloud and Collabora communicate with each other via `https://<domain>.ts.net` (the domain resolves to the host internally via `extra_hosts: host-gateway`).
